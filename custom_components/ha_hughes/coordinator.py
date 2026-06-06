@@ -406,6 +406,9 @@ class HughesCoordinator(DataUpdateCoordinator[HughesState | None]):
         # on the next reconnect, confirming both lines are receiving data.
         self._first_data_received = False
         self._is_dual_line = False
+        if self.state is not None:
+            self.state.line2 = None
+            self.state.is_dual_line = False
         self.async_update_listeners()
         self._schedule_reconnect()
 
@@ -526,8 +529,10 @@ class HughesCoordinator(DataUpdateCoordinator[HughesState | None]):
             if not self._is_dual_line:
                 self._is_dual_line = True
                 self.state.is_dual_line = True
+            # Log on the first L2 frame each connection (state.line2 is None until then)
+            if self.state.line2 is None:
                 _LOGGER.info(
-                    "Gen1 dual-line confirmed from %s: L2 %.2fV / %.4fA / error=%s",
+                    "Gen1 data from %s: L2 %.2fV / %.4fA / error=%s",
                     self._address,
                     line_data.voltage,
                     line_data.current,
@@ -542,7 +547,7 @@ class HughesCoordinator(DataUpdateCoordinator[HughesState | None]):
         if not self._first_data_received and not is_line2:
             self._first_data_received = True
             _LOGGER.info(
-                "First Gen1 data from %s: L1 %.2fV / %.4fA / error=%s",
+                "Gen1 data from %s: L1 %.2fV / %.4fA / error=%s",
                 self._address,
                 line_data.voltage,
                 line_data.current,
