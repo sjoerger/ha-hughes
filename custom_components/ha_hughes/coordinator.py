@@ -517,8 +517,16 @@ class HughesCoordinator(DataUpdateCoordinator[HughesState | None]):
             )
 
         if is_line2:
-            self.state.is_dual_line = True
-            self._is_dual_line = True
+            if not self._is_dual_line:
+                self._is_dual_line = True
+                self.state.is_dual_line = True
+                _LOGGER.info(
+                    "Gen1 dual-line confirmed from %s: L2 %.2fV / %.4fA / error=%s",
+                    self._address,
+                    line_data.voltage,
+                    line_data.current,
+                    line_data.error_text,
+                )
             self.state.line2 = line_data
         else:
             self.state.line1 = line_data
@@ -528,11 +536,21 @@ class HughesCoordinator(DataUpdateCoordinator[HughesState | None]):
         if not self._first_data_received and not is_line2:
             self._first_data_received = True
             _LOGGER.info(
-                "First Gen1 data from %s: %.2fV / %.4fA / error=%s",
+                "First Gen1 data from %s: L1 %.2fV / %.4fA / error=%s",
                 self._address,
                 line_data.voltage,
                 line_data.current,
                 line_data.error_text,
+            )
+        elif not is_line2 and self._is_dual_line and self.state.line2 is not None:
+            _LOGGER.debug(
+                "Hughes %s: L1=%.2fV/%.4fA  L2=%.2fV/%.4fA  total=%.1fW",
+                self._address,
+                self.state.line1.voltage,
+                self.state.line1.current,
+                self.state.line2.voltage,
+                self.state.line2.current,
+                self.state.line1.power + self.state.line2.power,
             )
 
         self.async_set_updated_data(self.state)
