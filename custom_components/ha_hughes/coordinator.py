@@ -18,6 +18,17 @@ Lifecycle:
     7. Handle CMD_DL_REPORT → HughesState; fire HA coordinator update
 
 Reference: Android HughesWatchdogDevicePlugin.kt, HughesGen2DevicePlugin.kt
+
+Stability fixes applied (June 2026):
+  - stop_notify called before disconnect to release BlueZ notify slot, preventing
+    ATT 0x0e (Unlikely Error) and org.bluez.Error.NotPermitted on reconnect.
+  - 2s settle delay after connect before start_notify, allowing BlueZ to fully
+    release stale notify registrations from prior connections.
+  - start_notify retried up to 3 times with 3s delay for residual slot leakage.
+  - No FFF5 writes: APK reverse engineering confirmed the app has no periodic
+    keepalive. FFF5 init writes (POWER ON TIME, SET:T) caused device instability
+    and have been omitted. The continuous FFE2 telemetry stream maintains the
+    GATT supervision timer without any application-level keepalive.
 """
 
 from __future__ import annotations
@@ -41,8 +52,6 @@ from .const import (
     CONF_GENERATION,
     DOMAIN,
     GEN1,
-    GEN1_KEEPALIVE_INTERVAL,
-    GEN1_KEEPALIVE_PAYLOAD,
     GEN1_NOTIFY_CHAR_UUID,
     GEN1_SERVICE_UUID,
     GEN1_WRITE_CHAR_UUID,
@@ -93,15 +102,14 @@ class HughesCoordinator(DataUpdateCoordinator[HughesState | None]):
         self._is_enhanced: bool = (
             _detect_enhanced(self._device_name) if self._generation == GEN2 else False
         )
-        self._is_dual_line: bool = False  # updated when first DLReport arrives
+        self._is_dual_line: bool = False
 
         # BLE client
         self._client: BleakClient | None = None
         self._connected = False
-        self._write_char_uuid: str | None = None  # set after service discovery (Gen2)
-        self._gen1_write_char_uuid: str | None = None  # fff5 keepalive target (Gen1)
+        self._write_char_uuid: str | None = None
 
-        # Protocol handlers (created fresh on each connection)
+        # Protocol handlers
         self._gen1_assembler: Gen1FrameAssembler | None = None
         self._gen2_framer: Gen2PacketFramer | None = None
         self._gen2_builder: Gen2CommandBuilder | None = None
@@ -115,7 +123,6 @@ class HughesCoordinator(DataUpdateCoordinator[HughesState | None]):
         self._watchdog_task: asyncio.Task[None] | None = None
         self._reconnect_task: asyncio.Task[None] | None = None
         self._reconnect_failures: int = 0
-        self._gen1_keepalive_task: asyncio.Task[None] | None = None
         self._connect_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
@@ -124,37 +131,30 @@ class HughesCoordinator(DataUpdateCoordinator[HughesState | None]):
 
     @property
     def connected(self) -> bool:
-        """Return True if BLE connection is active."""
         return self._connected
 
     @property
     def generation(self) -> str:
-        """Return the detected generation ('gen1' or 'gen2')."""
         return self._generation
 
     @property
     def is_enhanced(self) -> bool:
-        """Return True if this is a Gen2 enhanced model (E8/V8/E9/V9)."""
         return self._is_enhanced
 
     @property
     def is_dual_line(self) -> bool:
-        """Return True once dual-line operation is confirmed by device data."""
         return self._is_dual_line
 
     @property
     def address(self) -> str:
-        """Return the BLE address."""
         return self._address
 
     @property
     def device_name(self) -> str:
-        """Return the device name from config."""
         return self._device_name
 
     @property
     def data_healthy(self) -> bool:
-        """Return True if connected and receiving fresh data."""
         if not self._connected or self.state is None:
             return False
         if self._last_data_time == 0.0:
@@ -163,7 +163,6 @@ class HughesCoordinator(DataUpdateCoordinator[HughesState | None]):
 
     @property
     def last_data_age(self) -> float | None:
-        """Seconds since last data, or None if never received."""
         if self._last_data_time == 0.0:
             return None
         return time.monotonic() - self._last_data_time
@@ -213,10 +212,8 @@ class HughesCoordinator(DataUpdateCoordinator[HughesState | None]):
         self._reconnect_failures = 0
         _LOGGER.info("Connected to Hughes %s", self._address)
 
-        # Short delay before service discovery
         await asyncio.sleep(SERVICE_DISCOVERY_DELAY)
 
-        # Run generation-specific init
         try:
             if self._generation == GEN1:
                 ok = await self._init_gen1(client)
@@ -234,12 +231,17 @@ class HughesCoordinator(DataUpdateCoordinator[HughesState | None]):
             return
 
         self._start_watchdog()
-        if self._generation == GEN1:
-            self._start_gen1_keepalive()
         self.async_update_listeners()
 
     async def _init_gen1(self, client: BleakClient) -> bool:
-        """Initialize Gen1 connection: find service, enable notifications."""
+        """Initialize Gen1 connection: find service, enable notifications on FFE2.
+
+        No writes to FFF5 — APK reverse engineering confirmed the Android app
+        sends no periodic keepalive. The continuous FFE2 telemetry notification
+        stream maintains the GATT supervision timer without application writes.
+        FFF5 init writes (POWER ON TIME, SET:T) caused device instability and
+        have been deliberately omitted.
+        """
         services = client.services
         svc = services.get_service(GEN1_SERVICE_UUID)
         if svc is None:
@@ -255,27 +257,60 @@ class HughesCoordinator(DataUpdateCoordinator[HughesState | None]):
             _LOGGER.error("Gen1 notify characteristic %s not found", GEN1_NOTIFY_CHAR_UUID)
             return False
 
-        # Locate the write characteristic for keepalive — optional, warn if absent
+        # Locate FFF5 write/notify characteristic — used for commands and notify channel.
+        # The Android app enables notifications on both FFE2 and FFF5 in onServicesDiscovered.
+        # FFF5 notify is passive (no writes) — just signals readiness to the device.
         write_char = svc.get_characteristic(GEN1_WRITE_CHAR_UUID)
-        if write_char is None:
-            _LOGGER.warning(
-                "Gen1 write characteristic %s not found — keepalive disabled",
-                GEN1_WRITE_CHAR_UUID,
-            )
-        else:
-            self._gen1_write_char_uuid = GEN1_WRITE_CHAR_UUID
 
-        await asyncio.sleep(OPERATION_DELAY)
+        # Wait for BlueZ to fully release any stale notify registration from a
+        # prior connection. Without this delay ATT 0x0e fires on start_notify.
+        # Increased from 0.2s (SERVICE_DISCOVERY_DELAY) — device needs more time
+        # to complete GATT service table initialization under load.
+        await asyncio.sleep(2.0)
 
         self._gen1_assembler = Gen1FrameAssembler()
 
-        await client.start_notify(notify_char, self._on_gen1_notification)
-        _LOGGER.info("Gen1 notifications enabled on %s", GEN1_NOTIFY_CHAR_UUID)
+        # Retry start_notify up to 3 times — BlueZ occasionally holds the notify
+        # slot from a prior connection for a few seconds post-disconnect.
+        for attempt in range(3):
+            try:
+                await client.start_notify(notify_char, self._on_gen1_notification)
+                _LOGGER.info("Gen1 notifications enabled on %s", GEN1_NOTIFY_CHAR_UUID)
+                break
+            except BleakError as exc:
+                if attempt < 2:
+                    _LOGGER.warning(
+                        "Hughes %s: Gen1 start_notify attempt %d failed: %s — retrying in 3s",
+                        self._address,
+                        attempt + 1,
+                        exc,
+                    )
+                    await asyncio.sleep(3.0)
+                else:
+                    _LOGGER.error(
+                        "Hughes %s: Gen1 start_notify failed after 3 attempts: %s",
+                        self._address,
+                        exc,
+                    )
+                    raise
+
+        # Enable notifications on FFF5 — mirrors the Android app's onServicesDiscovered
+        # sequence which enables notify ON for both FFE2 and FFF5. This is passive
+        # (no data written) and signals to the device that the client is ready to
+        # receive on the command response channel.
+        if write_char is not None:
+            try:
+                await client.start_notify(write_char, self._on_gen1_fff5_notification)
+                _LOGGER.info("Gen1 FFF5 notifications enabled on %s", GEN1_WRITE_CHAR_UUID)
+            except BleakError as exc:
+                _LOGGER.debug(
+                    "Hughes %s: FFF5 start_notify failed (non-fatal): %s", self._address, exc
+                )
+
         return True
 
     async def _init_gen2(self, client: BleakClient) -> bool:
         """Initialize Gen2 connection: find service, enable notifications, send open command."""
-        # Best-effort MTU negotiation — packet framer handles any MTU transparently
         try:
             mtu = await client.get_mtu_size()
             _LOGGER.debug("Hughes Gen2 %s: current MTU = %d", self._address, mtu)
@@ -303,11 +338,9 @@ class HughesCoordinator(DataUpdateCoordinator[HughesState | None]):
 
         await asyncio.sleep(OPERATION_DELAY)
 
-        # Enable notifications
         await client.start_notify(rw_char, self._on_gen2_notification)
         _LOGGER.info("Gen2 notifications enabled on %s", GEN2_RW_CHAR_UUID)
 
-        # Send protocol open command
         try:
             await client.write_gatt_char(GEN2_RW_CHAR_UUID, GEN2_PROTOCOL_OPEN_CMD, response=True)
             _LOGGER.debug("Sent Gen2 protocol open command")
@@ -320,14 +353,12 @@ class HughesCoordinator(DataUpdateCoordinator[HughesState | None]):
     async def async_disconnect(self) -> None:
         """Disconnect and clean up."""
         self._stop_watchdog()
-        self._stop_gen1_keepalive()
         self._cancel_reconnect()
         if self._client:
             await self._safe_disconnect(self._client)
         self._client = None
         self._connected = False
         self._write_char_uuid = None
-        self._gen1_write_char_uuid = None
         self._gen1_assembler = None
         self._gen2_framer = None
         self._gen2_builder = None
@@ -341,11 +372,12 @@ class HughesCoordinator(DataUpdateCoordinator[HughesState | None]):
         org.bluez.Error.NotPermitted on the next start_notify call.
         """
         if self._generation == GEN1:
-            try:
-                await client.stop_notify(GEN1_NOTIFY_CHAR_UUID)
-                _LOGGER.debug("Hughes %s: Gen1 stop_notify sent", self._address)
-            except Exception:  # noqa: BLE001
-                pass
+            for char_uuid in (GEN1_NOTIFY_CHAR_UUID, GEN1_WRITE_CHAR_UUID):
+                try:
+                    await client.stop_notify(char_uuid)
+                    _LOGGER.debug("Hughes %s: stop_notify sent for %s", self._address, char_uuid)
+                except Exception:  # noqa: BLE001
+                    pass
         elif self._write_char_uuid:
             try:
                 await client.stop_notify(self._write_char_uuid)
@@ -362,11 +394,9 @@ class HughesCoordinator(DataUpdateCoordinator[HughesState | None]):
         """Handle unexpected BLE disconnection."""
         _LOGGER.warning("Hughes %s disconnected", self._address)
         self._stop_watchdog()
-        self._stop_gen1_keepalive()
         self._connected = False
         self._client = None
         self._write_char_uuid = None
-        self._gen1_write_char_uuid = None
         self._gen1_assembler = None
         self._gen2_framer = None
         self._gen2_builder = None
@@ -437,59 +467,13 @@ class HughesCoordinator(DataUpdateCoordinator[HughesState | None]):
                     age = time.monotonic() - self._last_data_time
                     if age > STALE_TIMEOUT:
                         _LOGGER.warning(
-                            "Hughes %s: no data for %.0fs — forcing reconnect", self._address, age
+                            "Hughes %s: no data for %.0fs — forcing reconnect",
+                            self._address,
+                            age,
                         )
                         if self._client:
                             await self._safe_disconnect(self._client)
                         break
-        except asyncio.CancelledError:
-            pass
-
-    # ------------------------------------------------------------------
-    # Gen1 keepalive
-    # ------------------------------------------------------------------
-
-    def _start_gen1_keepalive(self) -> None:
-        """Start periodic keepalive writes to prevent PMD connection drop."""
-        self._stop_gen1_keepalive()
-        if self._gen1_write_char_uuid is None:
-            _LOGGER.debug(
-                "Hughes %s: Gen1 keepalive not started — write characteristic unavailable",
-                self._address,
-            )
-            return
-        _LOGGER.debug(
-            "Hughes %s: starting Gen1 keepalive (interval=%.0fs)",
-            self._address,
-            GEN1_KEEPALIVE_INTERVAL,
-        )
-        self._gen1_keepalive_task = self._entry.async_create_background_task(
-            self.hass, self._gen1_keepalive_loop(), "hughes_gen1_keepalive"
-        )
-
-    def _stop_gen1_keepalive(self) -> None:
-        """Cancel the keepalive task if running."""
-        if self._gen1_keepalive_task and not self._gen1_keepalive_task.done():
-            self._gen1_keepalive_task.cancel()
-        self._gen1_keepalive_task = None
-
-    async def _gen1_keepalive_loop(self) -> None:
-        """Periodically write to fff5 to keep the PMD connection alive."""
-        try:
-            while self._connected and self._client is not None:
-                await asyncio.sleep(GEN1_KEEPALIVE_INTERVAL)
-                if not self._connected or self._client is None:
-                    break
-                try:
-                    await self._client.write_gatt_char(
-                        GEN1_WRITE_CHAR_UUID, GEN1_KEEPALIVE_PAYLOAD, response=False
-                    )
-                    _LOGGER.debug("Hughes %s: Gen1 keepalive sent", self._address)
-                except (BleakError, TimeoutError, OSError) as exc:
-                    _LOGGER.warning(
-                        "Hughes %s: Gen1 keepalive write failed: %s", self._address, exc
-                    )
-                    # Non-fatal — watchdog will handle stale data if connection is truly lost
         except asyncio.CancelledError:
             pass
 
@@ -509,6 +493,19 @@ class HughesCoordinator(DataUpdateCoordinator[HughesState | None]):
         line_data, is_line2 = result
         self._last_data_time = time.monotonic()
         self.hass.async_create_task(self._update_gen1_state(line_data, is_line2))
+
+    def _on_gen1_fff5_notification(
+        self, characteristic: BleakGATTCharacteristic, data: bytearray
+    ) -> None:
+        """Handle a notification on FFF5 (command response channel).
+
+        The device may send responses here. Currently logged at debug level only.
+        """
+        try:
+            text = bytes(data).decode("ascii", errors="replace").strip()
+            _LOGGER.debug("Hughes %s: FFF5 notification: %s", self._address, text)
+        except Exception:  # noqa: BLE001
+            _LOGGER.debug("Hughes %s: FFF5 raw notification: %s", self._address, data.hex())
 
     async def _update_gen1_state(self, line_data: HughesLineData, is_line2: bool) -> None:
         """Merge parsed Gen1 frame into coordinator state and notify entities."""
@@ -547,7 +544,6 @@ class HughesCoordinator(DataUpdateCoordinator[HughesState | None]):
         if self._gen2_framer is None:
             return
 
-        # Check for ASCII "ok" init response (before binary framing starts)
         if not self._first_data_received:
             try:
                 text = bytes(data).decode("ascii", errors="ignore").strip()
@@ -645,7 +641,9 @@ class HughesCoordinator(DataUpdateCoordinator[HughesState | None]):
         if self._gen2_builder is None:
             return
         _LOGGER.info(
-            "Hughes %s: neutral detection %s", self._address, "enabled" if enable else "disabled"
+            "Hughes %s: neutral detection %s",
+            self._address,
+            "enabled" if enable else "disabled",
         )
         await self._send_gen2(self._gen2_builder.set_neutral_detection(enable))
 
