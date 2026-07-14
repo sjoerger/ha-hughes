@@ -22,6 +22,8 @@ from ..const import (
     GEN1_ERROR_CODES,
     GEN1_FRAME_HEADER,
     GEN1_FRAME_SIZE,
+    GEN1_FREQ_MAX,
+    GEN1_FREQ_MIN,
     GEN1_OFF_CURRENT,
     GEN1_OFF_ERROR,
     GEN1_OFF_ENERGY,
@@ -65,6 +67,16 @@ def parse_gen1_frame(frame: bytes) -> tuple[HughesLineData, bool] | None:
         power = _parse_int32_be(frame, GEN1_OFF_POWER) / GEN1_SCALE_POWER
         energy = _parse_int32_be(frame, GEN1_OFF_ENERGY) / GEN1_SCALE_POWER
         frequency = _parse_int32_be(frame, GEN1_OFF_FREQUENCY) / 100.0
+
+        if not (GEN1_FREQ_MIN <= frequency <= GEN1_FREQ_MAX):
+            _LOGGER.warning(
+                "Gen1 frame rejected: implausible frequency %.2f Hz "
+                "(chunk pairing likely desynced) — header=%s",
+                frequency,
+                frame[0:3].hex(),
+            )
+            return None
+
         error_code = frame[GEN1_OFF_ERROR]
         error_text = GEN1_ERROR_CODES.get(error_code, f"Unknown ({error_code})")
 
@@ -109,6 +121,20 @@ class Gen1FrameAssembler:
 
         Returns a parsed (HughesLineData, is_line2) tuple when a complete frame
         is assembled, or None if more data is needed.
+
+        Resync note: the frame header check in parse_gen1_frame() only
+        validates chunk1's own bytes (frame[0:3]), so a chunk1 correctly
+        paired with the wrong chunk2 (e.g. after a reconnect leaves pairing
+        off by one) still "passes" and silently produces a frame with
+        garbage in the fields that live in the second half (frequency,
+        line marker). Since every genuine chunk1 starts with
+        GEN1_FRAME_HEADER, any incoming chunk that also starts with the
+        header while a chunk1 is already pending means the true chunk2 was
+        never delivered — the pending chunk1 is orphaned. Detecting this
+        and resyncing immediately (instead of blindly pairing whatever
+        arrives next) prevents a single missed/reordered notification from
+        permanently misaligning every subsequent frame for the rest of the
+        connection.
         """
         chunk = bytes(data)
 
@@ -121,8 +147,14 @@ class Gen1FrameAssembler:
             self._chunk1_time = time.monotonic()
             return None
 
+        starts_new_frame = chunk[0:3] == GEN1_FRAME_HEADER
+
         if self._chunk1 is None:
-            # First chunk of a frame pair
+            if not starts_new_frame:
+                # Orphan chunk2 with nothing pending — discard and wait for a
+                # genuine chunk1 rather than mispairing on the next chunk.
+                _LOGGER.debug("Gen1: discarding chunk with no pending chunk1 (no header)")
+                return None
             self._chunk1 = chunk
             self._chunk1_time = time.monotonic()
             _LOGGER.debug("Gen1: stored first chunk")
@@ -134,6 +166,18 @@ class Gen1FrameAssembler:
             _LOGGER.debug(
                 "Gen1: first chunk expired (%.2fs old) — treating current chunk as new first",
                 age,
+            )
+            self._chunk1 = chunk if starts_new_frame else None
+            self._chunk1_time = time.monotonic()
+            return None
+
+        if starts_new_frame:
+            # This chunk is itself a frame start, so the true chunk2 for the
+            # pending chunk1 never arrived (dropped/reordered notification).
+            # Resync onto this chunk instead of mispairing it as a chunk2.
+            _LOGGER.warning(
+                "Gen1: chunk pairing desync detected (expected chunk2, got new "
+                "chunk1) — resyncing"
             )
             self._chunk1 = chunk
             self._chunk1_time = time.monotonic()

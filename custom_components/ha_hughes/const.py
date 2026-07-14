@@ -59,6 +59,14 @@ GEN1_OFF_LINE_MARKER = 37
 
 GEN1_SCALE_POWER = 10_000.0   # divide int32 by this to get engineering units
 
+# Plausible frequency range (Hz) for validating parsed frames. A desynced
+# chunk pairing (see Gen1FrameAssembler) can still pass the 3-byte header
+# check yet contain garbage in the frequency field, since that check only
+# validates chunk1's bytes. Anything outside 45-65 Hz is physically
+# impossible for mains power and indicates a corrupted/misaligned frame.
+GEN1_FREQ_MIN = 45.0
+GEN1_FREQ_MAX = 65.0
+
 # Gen1 error codes
 GEN1_ERROR_CODES: dict[int, str] = {
     0: "OK",

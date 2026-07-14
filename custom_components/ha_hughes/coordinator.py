@@ -29,6 +29,18 @@ Stability fixes applied (June 2026):
     keepalive. FFF5 init writes (POWER ON TIME, SET:T) caused device instability
     and have been omitted. The continuous FFE2 telemetry stream maintains the
     GATT supervision timer without any application-level keepalive.
+  - Gen1 chunk-pairing resync (July 2026): a BLE notification dropped or
+    reordered during a reconnect could leave Gen1FrameAssembler's 20-byte
+    chunk pairing off by one for the rest of the connection, silently
+    producing frames with garbage frequency/line-marker data (the frame
+    header check only validates the first chunk, so a mispaired frame still
+    passed). Root-caused via Home Assistant history analysis: L2 Frequency
+    was clean for hours, then went to ~96,000-300,000 Hz immediately after a
+    reconnect and stayed corrupted until the next full HA restart. Fixed in
+    protocol/gen1.py: the assembler now detects when a "second" chunk itself
+    looks like a frame start and resyncs instead of mispairing, and
+    parse_gen1_frame() rejects frames with an implausible frequency
+    (outside 45-65 Hz) as a backstop.
 """
 
 from __future__ import annotations
