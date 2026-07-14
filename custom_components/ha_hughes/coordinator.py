@@ -40,7 +40,18 @@ Stability fixes applied (June 2026):
     protocol/gen1.py: the assembler now detects when a "second" chunk itself
     looks like a frame start and resyncs instead of mispairing, and
     parse_gen1_frame() rejects frames with an implausible frequency
-    (outside 45-65 Hz) as a backstop.
+    (outside 45-65 Hz) as a backstop. Follow-up: the plausibility check was
+    broadened to voltage/current/power/energy as well (not just frequency),
+    matching an equivalent fix independently discovered upstream
+    (phurth/ha-hughes issue #3); energy sensors moved from
+    SensorStateClass.TOTAL_INCREASING to TOTAL with a fixed last_reset so a
+    corrupted reading can no longer be misread as a meter reset and corrupt
+    long-term statistics. In production, resync events were found to trigger
+    routinely on some connections (bursts of several per second, not just at
+    reconnect) — HA history was checked directly and confirmed continuous,
+    physically plausible data throughout, so the resync log line was moved
+    from warning to debug to avoid flooding the log for expected,
+    self-correcting behavior.
 """
 
 from __future__ import annotations

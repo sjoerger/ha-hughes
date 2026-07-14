@@ -204,7 +204,11 @@ class Gen1FrameAssembler:
             # This chunk is itself a frame start, so the true chunk2 for the
             # pending chunk1 never arrived (dropped/reordered notification).
             # Resync onto this chunk instead of mispairing it as a chunk2.
-            _LOGGER.warning(
+            # Logged at debug: field validation confirmed this recovers
+            # cleanly and happens routinely enough (bursts of several per
+            # second on some connections) that warning-level would flood
+            # the log without being actionable.
+            _LOGGER.debug(
                 "Gen1: chunk pairing desync detected (expected chunk2, got new "
                 "chunk1) — resyncing"
             )
