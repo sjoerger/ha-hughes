@@ -19,6 +19,8 @@ import time
 from ..const import (
     GEN1_CHUNK_SIZE,
     GEN1_CHUNK_TIMEOUT,
+    GEN1_CURRENT_MAX,
+    GEN1_ENERGY_MAX,
     GEN1_ERROR_CODES,
     GEN1_FRAME_HEADER,
     GEN1_FRAME_SIZE,
@@ -31,7 +33,9 @@ from ..const import (
     GEN1_OFF_LINE_MARKER,
     GEN1_OFF_POWER,
     GEN1_OFF_VOLTAGE,
+    GEN1_POWER_MAX,
     GEN1_SCALE_POWER,
+    GEN1_VOLTAGE_MAX,
 )
 from ..models import HughesLineData
 
@@ -41,6 +45,24 @@ _LOGGER = logging.getLogger(__name__)
 def _parse_int32_be(data: bytes, offset: int) -> int:
     """Parse a big-endian signed int32 from data at offset."""
     return struct.unpack_from(">i", data, offset)[0]
+
+
+def _values_plausible(
+    voltage: float, current: float, power: float, energy: float, frequency: float
+) -> bool:
+    """Return True if all parsed quantities fall within physical bounds.
+
+    All quantities are non-negative magnitudes (shore-power draw), so a
+    negative value indicates a misassembled/corrupt frame, as does any value
+    above its ceiling.
+    """
+    return (
+        0.0 <= voltage <= GEN1_VOLTAGE_MAX
+        and 0.0 <= current <= GEN1_CURRENT_MAX
+        and 0.0 <= power <= GEN1_POWER_MAX
+        and 0.0 <= energy <= GEN1_ENERGY_MAX
+        and GEN1_FREQ_MIN <= frequency <= GEN1_FREQ_MAX
+    )
 
 
 def parse_gen1_frame(frame: bytes) -> tuple[HughesLineData, bool] | None:
@@ -68,15 +90,6 @@ def parse_gen1_frame(frame: bytes) -> tuple[HughesLineData, bool] | None:
         energy = _parse_int32_be(frame, GEN1_OFF_ENERGY) / GEN1_SCALE_POWER
         frequency = _parse_int32_be(frame, GEN1_OFF_FREQUENCY) / 100.0
 
-        if not (GEN1_FREQ_MIN <= frequency <= GEN1_FREQ_MAX):
-            _LOGGER.warning(
-                "Gen1 frame rejected: implausible frequency %.2f Hz "
-                "(chunk pairing likely desynced) — header=%s",
-                frequency,
-                frame[0:3].hex(),
-            )
-            return None
-
         error_code = frame[GEN1_OFF_ERROR]
         error_text = GEN1_ERROR_CODES.get(error_code, f"Unknown ({error_code})")
 
@@ -86,6 +99,22 @@ def parse_gen1_frame(frame: bytes) -> tuple[HughesLineData, bool] | None:
 
     except (struct.error, IndexError) as exc:
         _LOGGER.warning("Gen1 frame parse error: %s", exc)
+        return None
+
+    # Reject misassembled frames whose values are physically impossible. This
+    # keeps garbage out of the live state and, critically, out of long-term
+    # statistics — a desynced chunk pairing can still pass the header check
+    # (which only validates chunk1's bytes) yet contain garbage in any field.
+    if not _values_plausible(voltage, current, power, energy, frequency):
+        _LOGGER.warning(
+            "Gen1 frame rejected: implausible values "
+            "(V=%.4f A=%.4f W=%.4f kWh=%.4f Hz=%.4f) — chunk pairing likely desynced",
+            voltage,
+            current,
+            power,
+            energy,
+            frequency,
+        )
         return None
 
     return (

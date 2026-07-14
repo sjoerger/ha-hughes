@@ -26,14 +26,14 @@ Connects directly to the device over Bluetooth Low Energy — there is no cloud 
 | L1 Voltage | Sensor | voltage | V | |
 | L1 Current | Sensor | current | A | |
 | L1 Power | Sensor | power | W | |
-| L1 Energy | Sensor | energy | kWh | Total increasing |
+| L1 Energy | Sensor | energy | kWh | Total (see note) |
 | L1 Frequency | Sensor | frequency | Hz | |
 | L1 Error | Sensor (diag) | — | — | Text description |
 | L1 Error Code | Sensor (diag) | — | — | Numeric code |
 | L2 Voltage | Sensor | voltage | V | Dual-line only |
 | L2 Current | Sensor | current | A | Dual-line only |
 | L2 Power | Sensor | power | W | Dual-line only |
-| L2 Energy | Sensor | energy | kWh | Dual-line only |
+| L2 Energy | Sensor | energy | kWh | Dual-line only; Total (see note) |
 | L2 Frequency | Sensor | frequency | Hz | Dual-line only |
 | L2 Error | Sensor (diag) | — | — | Dual-line only |
 | L2 Error Code | Sensor (diag) | — | — | Dual-line only |
@@ -42,6 +42,8 @@ Connects directly to the device over Bluetooth Low Energy — there is no cloud 
 | Signal Strength | Sensor (diag) | signal_strength | dBm | Updated on reconnect only — see note |
 
 > **Signal Strength (RSSI) note:** The PMD stops advertising once a GATT connection is established — standard BLE behavior. The Signal Strength sensor therefore captures the RSSI seen during the most recent connection attempt rather than updating continuously during a session. It refreshes on every reconnect, making it useful for comparing signal quality when moving to a new location or diagnosing range-related instability. As a guide: -55 dBm or better is excellent; -75 dBm is marginal; -80 dBm or below may contribute to connection instability.
+>
+> **Energy (Total vs. Total Increasing) note:** Energy sensors use `state_class: total` with a fixed reset epoch rather than `total_increasing`. A cumulative energy counter should never decrease in normal operation, but a corrupted Gen1 frame occasionally could (see Protocol below) — under `total_increasing`, HA's statistics engine treats any decrease as a meter reset and pads the long-term statistics sum with the full new value, which can corrupt historical totals into wildly implausible numbers even though the live sensor value stays correct. `total` instead accumulates signed deltas, so a glitch spike is cancelled out by its own recovery drop.
 
 ### Gen2 only
 
@@ -111,7 +113,8 @@ To disable the delay entirely, set `startup_delay = 0.0`.
 - **Notify** (`FFF5`): command response channel, enabled on connect
 - Big-endian int32 values ÷ 10000 for electrical measurements
 - No authentication or pairing required
-- **Chunk resync**: a dropped or reordered BLE notification (most often right after a reconnect) can leave the 20-byte chunk pairing off by one, silently producing frames with garbage in the second-chunk fields (frequency, L1/L2 line marker) while the first-chunk fields (voltage/current/power/energy) still look plausible. `Gen1FrameAssembler` detects this — an incoming chunk that itself starts with the frame header while a chunk is already pending means the true second chunk never arrived — and resyncs immediately instead of mispairing. As a backstop, frames with an out-of-range frequency (outside 45–65 Hz) are rejected outright rather than reaching Home Assistant.
+- **Chunk resync**: a dropped or reordered BLE notification (most often right after a reconnect) can leave the 20-byte chunk pairing off by one, silently producing frames with garbage in one or more fields while other fields still look plausible. `Gen1FrameAssembler` detects this — an incoming chunk that itself starts with the frame header while a chunk is already pending means the true second chunk never arrived — and resyncs immediately instead of mispairing.
+- **Plausibility backstop**: as a second layer of defense, `parse_gen1_frame()` rejects any frame where voltage, current, power, energy, or frequency falls outside a physically plausible range (e.g. frequency outside 45–65 Hz) rather than letting it reach Home Assistant, even if the resync heuristic above misses a case.
 
 ### Gen2 (WD\_\* name prefix)
 
@@ -149,11 +152,11 @@ Use **Download diagnostics** from the integration page for a full runtime state 
 - L2 entities are created automatically when the first L2 telemetry frame is received. On first installation, wait up to 60 seconds after initial connection for L2 data to appear.
 - Confirm dual-line operation in the logs: `Gen1 data from <addr>: L2 <V> / <A> / error=OK`
 
-### L2 Frequency (or other L2 values) spike to impossible numbers / graphs look erratic
+### L1/L2 values spike to impossible numbers / graphs look erratic
 
-- This is a known Gen1 dual-line issue: a BLE notification dropped or reordered during a reconnect could desync the 20-byte chunk pairing, producing frames with garbage frequency/line-marker data that still passed the (too-weak) frame header check. It typically showed up as `L2 Frequency` reading tens of thousands of Hz, and could also cause `L2 Energy` (and any `Total Energy` derived from it) to appear non-monotonic, triggering `total_increasing` warnings in the HA logs.
-- Fixed by adding chunk-pairing resync detection plus a frequency plausibility check (see **Chunk resync** under Protocol above) — update to the latest version if you're still seeing this.
-- Historical corrupted data recorded before updating is cosmetic only (it lives in the History graph for that period) and does not need manual cleanup unless those entities feed your Energy Dashboard, in which case check for a phantom consumption spike on the affected date and use Home Assistant's statistics "Adjust sum" tool to correct it.
+- This is a known Gen1 issue: a BLE notification dropped or reordered during a reconnect could desync the 20-byte chunk pairing, producing frames with garbage in one or more fields that still passed the (too-weak) frame header check. It typically showed up as `L2 Frequency` reading tens of thousands of Hz, and could cause energy readings to appear non-monotonic.
+- Fixed by chunk-pairing resync detection plus a plausibility check across all fields (see **Chunk resync** and **Plausibility backstop** under Protocol above), together with switching energy sensors from `total_increasing` to `total` so a decrease is never misread as a meter reset — update to the latest version if you're still seeing this.
+- Historical corrupted data recorded before updating is mostly cosmetic (it lives in the History graph for that period) and does not need manual cleanup unless those entities feed your Energy Dashboard, in which case check for a phantom consumption spike on the affected date and use Home Assistant's statistics "Adjust sum" tool to correct it.
 
 ## License
 

@@ -59,13 +59,20 @@ GEN1_OFF_LINE_MARKER = 37
 
 GEN1_SCALE_POWER = 10_000.0   # divide int32 by this to get engineering units
 
-# Plausible frequency range (Hz) for validating parsed frames. A desynced
-# chunk pairing (see Gen1FrameAssembler) can still pass the 3-byte header
-# check yet contain garbage in the frequency field, since that check only
-# validates chunk1's bytes. Anything outside 45-65 Hz is physically
-# impossible for mains power and indicates a corrupted/misaligned frame.
+# Plausibility bounds for validating parsed Gen1 frames. A desynced chunk
+# pairing (see Gen1FrameAssembler) can still pass the 3-byte header check yet
+# contain garbage in one or more fields, since that check only validates
+# chunk1's first 3 bytes. Values are shore-power draw magnitudes and are
+# always non-negative; anything outside these ranges indicates a
+# corrupted/misaligned frame. Frequency is checked tightly (45-65 Hz covers
+# 50/60 Hz mains with margin); the others are generous upper bounds meant
+# only to catch gross corruption, not to model real electrical limits.
 GEN1_FREQ_MIN = 45.0
 GEN1_FREQ_MAX = 65.0
+GEN1_VOLTAGE_MAX = 300.0        # V — nominal 120/240 + headroom
+GEN1_CURRENT_MAX = 250.0        # A — 50A unit + generous margin for misreads
+GEN1_POWER_MAX = 60_000.0       # W — headroom above any realistic RV draw
+GEN1_ENERGY_MAX = 10_000_000.0  # kWh — lifetime cumulative ceiling, sanity backstop
 
 # Gen1 error codes
 GEN1_ERROR_CODES: dict[int, str] = {
