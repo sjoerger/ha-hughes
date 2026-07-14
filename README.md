@@ -129,7 +129,7 @@ To disable the delay entirely, set `startup_delay = 0.0`.
 ```yaml
 logger:
   logs:
-    custom_components.hughes: debug
+    custom_components.ha_hughes: debug
 ```
 
 Use **Download diagnostics** from the integration page for a full runtime state dump including raw frame bytes (Gen2), connection health, and all parsed values.
